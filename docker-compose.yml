@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  nexus-video-call:
+    build: .
+    container_name: nexus-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    # Optional: If you want to use a reverse proxy like Nginx Proxy Manager or Traefik,
+    # you might not need to expose ports directly here, but map them internally.
+    networks:
+      - nexus-network
+
+networks:
+  nexus-network:
+    driver: bridge
