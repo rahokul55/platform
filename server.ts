@@ -8,7 +8,6 @@ async function startServer() {
   const PORT = 3000;
   const httpServer = createServer(app);
   
-  // Socket.io for WebRTC Signaling
   const io = new Server(httpServer, {
     cors: {
       origin: "*",
@@ -16,38 +15,48 @@ async function startServer() {
     }
   });
 
-  // API routes FIRST
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", message: "Nexus Server is running!" });
   });
 
-  // Basic Signaling Logic for WebRTC
   io.on("connection", (socket) => {
     console.log("New user connected:", socket.id);
 
-    socket.on("join-room", (roomId, userId) => {
-      console.log(`User ${userId} joined room ${roomId}`);
+    socket.on("join-room", (roomId, userName) => {
+      console.log(`User ${userName} (${socket.id}) joined room ${roomId}`);
       socket.join(roomId);
       
-      // Notify others in the room
-      socket.to(roomId).emit("user-connected", userId);
+      socket.to(roomId).emit("user-connected", { userId: socket.id, userName });
 
-      // Handle signaling messages (offer, answer, ice-candidate)
-      socket.on("signal", (data) => {
-        io.to(data.to).emit("signal", {
-          from: socket.id,
-          signal: data.signal
+      socket.on("offer", (payload) => {
+        io.to(payload.userToSignal).emit("offer", {
+          signal: payload.signal,
+          callerID: payload.callerID,
+          callerName: payload.callerName
+        });
+      });
+
+      socket.on("answer", (payload) => {
+        io.to(payload.callerID).emit("answer", {
+          signal: payload.signal,
+          id: socket.id
+        });
+      });
+
+      socket.on("ice-candidate", (payload) => {
+        io.to(payload.target).emit("ice-candidate", {
+          candidate: payload.candidate,
+          id: socket.id
         });
       });
 
       socket.on("disconnect", () => {
-        console.log(`User ${userId} disconnected`);
-        socket.to(roomId).emit("user-disconnected", userId);
+        console.log(`User ${socket.id} disconnected`);
+        socket.to(roomId).emit("user-disconnected", socket.id);
       });
     });
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -55,7 +64,6 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // In production, serve the built frontend files
     app.use(express.static("dist"));
   }
 

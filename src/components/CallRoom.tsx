@@ -1,15 +1,40 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { io, Socket } from 'socket.io-client';
 import { 
-  MonitorPlay, Settings, Info, Mic, MicOff, Video, VideoOff, 
-  MonitorUp, MoreHorizontal, PhoneOff, Smile, 
-  Users, Search, UserMinus, Ban
+  MonitorPlay, Settings, Mic, MicOff, Video, VideoOff, 
+  MonitorUp, PhoneOff, Users
 } from 'lucide-react';
 
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ]
+};
+
+function VideoElement({ stream, muted = false, className }: { stream: MediaStream, muted?: boolean, className?: string }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    if (ref.current && stream) {
+      ref.current.srcObject = stream;
+    }
+  }, [stream]);
+  return <video ref={ref} autoPlay playsInline muted={muted} className={className} />;
+}
+
 export default function CallRoom({ name, room, onLeave }: { name: string, room: string, onLeave: () => void }) {
+  const [peers, setPeers] = useState<{id: string, stream: MediaStream, name: string}[]>([]);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [showSidebar, setShowSidebar] = useState(true);
   const [currentTime, setCurrentTime] = useState('00:00:00');
+
+  const socketRef = useRef<Socket | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const peersRef = useRef<{[key: string]: RTCPeerConnection}>({});
+  const namesRef = useRef<{[key: string]: string}>({});
 
   useEffect(() => {
     let seconds = 0;
@@ -23,9 +48,175 @@ export default function CallRoom({ name, room, onLeave }: { name: string, room: 
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    socketRef.current = io('/', { path: '/socket.io' });
+    
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(stream => {
+      localStreamRef.current = stream;
+      setPeers(prev => [...prev]); // trigger re-render
+
+      socketRef.current?.emit('join-room', room, name);
+
+      socketRef.current?.on('user-connected', async (payload: {userId: string, userName: string}) => {
+        namesRef.current[payload.userId] = payload.userName;
+        const peer = createPeer(payload.userId, socketRef.current!.id, stream, name);
+        peersRef.current[payload.userId] = peer;
+      });
+
+      socketRef.current?.on('offer', async (payload: {signal: RTCSessionDescriptionInit, callerID: string, callerName: string}) => {
+        namesRef.current[payload.callerID] = payload.callerName;
+        const peer = addPeer(payload.signal, payload.callerID, stream, payload.callerName);
+        peersRef.current[payload.callerID] = peer;
+      });
+
+      socketRef.current?.on('answer', async (payload: {signal: RTCSessionDescriptionInit, id: string}) => {
+        const peer = peersRef.current[payload.id];
+        if (peer) {
+          await peer.setRemoteDescription(new RTCSessionDescription(payload.signal));
+        }
+      });
+
+      socketRef.current?.on('ice-candidate', async (payload: {candidate: RTCIceCandidateInit, id: string}) => {
+        const peer = peersRef.current[payload.id];
+        if (peer) {
+          await peer.addIceCandidate(new RTCIceCandidate(payload.candidate)).catch(e => console.error(e));
+        }
+      });
+
+      socketRef.current?.on('user-disconnected', (userId: string) => {
+        if (peersRef.current[userId]) {
+          peersRef.current[userId].close();
+          delete peersRef.current[userId];
+        }
+        setPeers(prev => prev.filter(p => p.id !== userId));
+      });
+    }).catch(err => {
+      console.error("Error accessing media devices.", err);
+      alert("Kamera veya mikrofon izni alınamadı. Lütfen tarayıcı ayarlarınızı kontrol edin.");
+    });
+
+    return () => {
+      socketRef.current?.disconnect();
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+      screenStreamRef.current?.getTracks().forEach(track => track.stop());
+      Object.values(peersRef.current).forEach(peer => peer.close());
+    };
+  }, [room, name]);
+
+  function createPeer(userToSignal: string, callerID: string, stream: MediaStream, callerName: string) {
+    const peer = new RTCPeerConnection(ICE_SERVERS);
+    stream.getTracks().forEach(track => peer.addTrack(track, stream));
+
+    peer.onicecandidate = (e) => {
+      if (e.candidate) {
+        socketRef.current?.emit('ice-candidate', { target: userToSignal, candidate: e.candidate });
+      }
+    };
+
+    peer.ontrack = (e) => {
+      setPeers(prev => {
+        if (prev.find(p => p.id === userToSignal)) return prev;
+        return [...prev, { id: userToSignal, stream: e.streams[0], name: namesRef.current[userToSignal] || 'Participant' }];
+      });
+    };
+
+    peer.onnegotiationneeded = async () => {
+      try {
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        socketRef.current?.emit('offer', { userToSignal, callerID, callerName, signal: peer.localDescription });
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    return peer;
+  }
+
+  function addPeer(incomingSignal: RTCSessionDescriptionInit, callerID: string, stream: MediaStream, callerName: string) {
+    const peer = new RTCPeerConnection(ICE_SERVERS);
+    stream.getTracks().forEach(track => peer.addTrack(track, stream));
+
+    peer.onicecandidate = (e) => {
+      if (e.candidate) {
+        socketRef.current?.emit('ice-candidate', { target: callerID, candidate: e.candidate });
+      }
+    };
+
+    peer.ontrack = (e) => {
+      setPeers(prev => {
+        if (prev.find(p => p.id === callerID)) return prev;
+        return [...prev, { id: callerID, stream: e.streams[0], name: callerName }];
+      });
+    };
+
+    peer.setRemoteDescription(new RTCSessionDescription(incomingSignal)).then(async () => {
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      socketRef.current?.emit('answer', { signal: peer.localDescription, callerID });
+    }).catch(err => console.error(err));
+
+    return peer;
+  }
+
+  const toggleMute = () => {
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsMuted(!audioTrack.enabled);
+      }
+    }
+  };
+
+  const toggleVideo = () => {
+    if (localStreamRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled;
+        setIsVideoOff(!videoTrack.enabled);
+      }
+    }
+  };
+
+  const toggleScreenShare = async () => {
+    if (!isScreenSharing) {
+      try {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+        screenStreamRef.current = screenStream;
+        const screenTrack = screenStream.getVideoTracks()[0];
+        
+        Object.values(peersRef.current).forEach(peer => {
+          const sender = peer.getSenders().find(s => s.track?.kind === 'video');
+          if (sender) sender.replaceTrack(screenTrack);
+        });
+
+        screenTrack.onended = () => stopScreenShare();
+        setIsScreenSharing(true);
+      } catch (err) {
+        console.error("Error sharing screen", err);
+      }
+    } else {
+      stopScreenShare();
+    }
+  };
+
+  const stopScreenShare = () => {
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    const videoTrack = localStreamRef.current?.getVideoTracks()[0];
+    if (videoTrack) {
+      Object.values(peersRef.current).forEach(peer => {
+        const sender = peer.getSenders().find(s => s.track?.kind === 'video');
+        if (sender) sender.replaceTrack(videoTrack);
+      });
+    }
+    setIsScreenSharing(false);
+  };
+
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0c] text-white overflow-hidden">
-      {/* Header */}
       <header className="flex items-center justify-between border-b border-slate-800 bg-[#16161e] px-6 py-3 shrink-0">
         <div className="flex items-center gap-3">
           <div className="bg-[#ec5b13] p-1.5 rounded-lg flex items-center justify-center">
@@ -33,137 +224,77 @@ export default function CallRoom({ name, room, onLeave }: { name: string, room: 
           </div>
           <div className="flex flex-col">
             <h2 className="text-white text-lg font-bold leading-none tracking-tight">Nexus Room: {room}</h2>
-            <p className="text-xs text-slate-400 font-medium">Design Sync Session • {currentTime}</p>
+            <p className="text-xs text-slate-400 font-medium">Live Session • {currentTime}</p>
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <div className="flex -space-x-2 mr-4">
-            <img src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=100&q=80" alt="User" className="w-8 h-8 rounded-full border-2 border-[#16161e] object-cover" />
-            <img src="https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?auto=format&fit=crop&w=100&q=80" alt="User" className="w-8 h-8 rounded-full border-2 border-[#16161e] object-cover" />
-            <div className="w-8 h-8 rounded-full border-2 border-[#16161e] bg-slate-800 flex items-center justify-center text-[10px] font-bold text-white">
-              +12
-            </div>
+          <div className="w-8 h-8 rounded-full border-2 border-[#16161e] bg-slate-800 flex items-center justify-center text-[10px] font-bold text-white">
+            {peers.length + 1}
           </div>
           <button className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 transition-colors">
             <Settings className="w-5 h-5" />
           </button>
-          <button className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 transition-colors">
-            <Info className="w-5 h-5" />
-          </button>
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="flex flex-1 overflow-hidden relative">
-        {/* Stage */}
         <div className="flex-1 flex flex-col p-4 gap-4 relative overflow-y-auto">
-          {/* Main Screen Share */}
-          <div className="flex-1 min-h-[400px] bg-[#16161e] rounded-xl overflow-hidden relative group border border-slate-800">
-            <div className="absolute inset-0 bg-gradient-to-br from-slate-800 to-slate-900 flex items-center justify-center">
-              {/* Mockup of shared screen */}
-              <div className="w-3/4 h-3/4 bg-slate-900 rounded-lg shadow-2xl border border-slate-700 p-6 flex flex-col gap-4">
-                <div className="flex items-center justify-between">
-                  <div className="flex gap-2">
-                    <div className="w-3 h-3 rounded-full bg-red-400"></div>
-                    <div className="w-3 h-3 rounded-full bg-yellow-400"></div>
-                    <div className="w-3 h-3 rounded-full bg-green-400"></div>
-                  </div>
-                  <div className="text-xs text-slate-400 font-mono">figma.com/file/nexus-design-system</div>
+          <div className={`flex-1 grid gap-4 ${peers.length === 0 ? 'grid-cols-1' : peers.length === 1 ? 'grid-cols-2' : 'grid-cols-2 md:grid-cols-3'}`}>
+            
+            <div className="relative rounded-xl overflow-hidden bg-slate-800 border border-slate-700 group flex items-center justify-center">
+              {localStreamRef.current && (
+                <VideoElement 
+                  stream={isScreenSharing && screenStreamRef.current ? screenStreamRef.current : localStreamRef.current} 
+                  muted={true} 
+                  className={`absolute inset-0 w-full h-full object-cover ${!isScreenSharing ? 'scale-x-[-1]' : ''}`} 
+                />
+              )}
+              {isVideoOff && !isScreenSharing && (
+                <div className="absolute inset-0 bg-slate-800 flex items-center justify-center z-10">
+                  <VideoOff className="w-12 h-12 text-slate-500" />
                 </div>
-                <div className="flex-1 grid grid-cols-3 gap-4">
-                  <div className="col-span-2 bg-slate-800/50 rounded-lg border border-dashed border-slate-700"></div>
-                  <div className="flex flex-col gap-4">
-                    <div className="h-24 bg-[#ec5b13]/20 rounded-lg"></div>
-                    <div className="h-24 bg-purple-500/20 rounded-lg"></div>
-                    <div className="flex-1 bg-slate-800/50 rounded-lg"></div>
-                  </div>
+              )}
+              <div className="absolute bottom-4 left-4 px-3 py-1.5 bg-black/60 backdrop-blur-sm rounded-lg text-xs text-white z-20 flex items-center gap-2">
+                {name} (You)
+                {isMuted && <MicOff className="w-3 h-3 text-red-400" />}
+              </div>
+              {isScreenSharing && (
+                <div className="absolute top-4 left-4 bg-[#ec5b13] text-white text-xs font-bold px-3 py-1.5 rounded-full flex items-center gap-2 shadow-lg z-20">
+                  <MonitorUp className="w-4 h-4" />
+                  You are sharing screen
+                </div>
+              )}
+            </div>
+
+            {peers.map(peer => (
+              <div key={peer.id} className="relative rounded-xl overflow-hidden bg-slate-800 border border-slate-700 group flex items-center justify-center">
+                <VideoElement stream={peer.stream} className="absolute inset-0 w-full h-full object-cover" />
+                <div className="absolute bottom-4 left-4 px-3 py-1.5 bg-black/60 backdrop-blur-sm rounded-lg text-xs text-white z-20">
+                  {peer.name}
                 </div>
               </div>
-            </div>
-
-            {/* Presenter PIP */}
-            <div className="absolute top-4 right-4 w-48 aspect-video bg-slate-900 rounded-lg border-2 border-[#ec5b13] shadow-xl overflow-hidden">
-              <img src="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=600" alt="Presenter" className="w-full h-full object-cover" />
-              <div className="absolute bottom-2 left-2 bg-black/60 px-2 py-0.5 rounded text-[10px] text-white flex items-center gap-1">
-                <Mic className="w-3 h-3 text-[#10b981]" />
-                Sarah Jenkins
-              </div>
-            </div>
-
-            {/* Badge */}
-            <div className="absolute top-4 left-4 bg-[#ec5b13] text-white text-xs font-bold px-3 py-1.5 rounded-full flex items-center gap-2 shadow-lg">
-              <MonitorUp className="w-4 h-4" />
-              Sarah is sharing screen
-            </div>
-          </div>
-
-          {/* Bottom Participants Row */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 h-40 shrink-0">
-            <ParticipantVideo name={name} img="https://images.unsplash.com/photo-1539571696357-5a69c17a67c6?auto=format&fit=crop&q=80&w=300" muted={isMuted} videoOff={isVideoOff} isYou />
-            <ParticipantVideo name="Maria Garcia" img="https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&q=80&w=300" muted={true} />
-            <ParticipantVideo name="James Wilson" img="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=300" muted={false} />
-            <div className="relative rounded-xl overflow-hidden bg-slate-800 border border-slate-700 flex items-center justify-center">
-              <div className="text-center">
-                <VideoOff className="w-8 h-8 text-slate-500 mx-auto mb-2" />
-                <p className="text-[10px] text-slate-400">Emma Wilson</p>
-              </div>
-            </div>
+            ))}
           </div>
         </div>
 
-        {/* Sidebar */}
         {showSidebar && (
           <aside className="w-80 bg-[#16161e] border-l border-slate-800 flex flex-col shrink-0">
             <div className="p-4 border-b border-slate-800">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-bold">Participants</h3>
-                <span className="bg-[#ec5b13]/20 text-[#ec5b13] text-[10px] font-bold px-2 py-1 rounded-full">14 Online</span>
-              </div>
-              <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4" />
-                <input 
-                  type="text" 
-                  placeholder="Search people..." 
-                  className="w-full bg-slate-900 border-none rounded-lg text-sm pl-10 pr-4 py-2 focus:ring-1 focus:ring-[#ec5b13] outline-none text-white placeholder:text-slate-500"
-                />
+                <span className="bg-[#ec5b13]/20 text-[#ec5b13] text-[10px] font-bold px-2 py-1 rounded-full">{peers.length + 1} Online</span>
               </div>
             </div>
-            
-            <div className="flex-1 overflow-y-auto p-2 space-y-4">
-              {/* Presenters */}
-              <div>
-                <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 px-2">Presenters — 2</h4>
-                <div className="space-y-1">
-                  <ParticipantListItem name="Sarah Jenkins" role="Host (Presenting)" img="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&q=80&w=150" isHost isSpeaking />
-                  <ParticipantListItem name="Michael Chen" role="Product Manager" img="https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?auto=format&fit=crop&q=80&w=150" canKick />
-                </div>
-              </div>
-
-              {/* Viewers */}
-              <div>
-                <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 px-2">Viewers — 12</h4>
-                <div className="space-y-1">
-                  <ParticipantListItem name="David Smith" role="UX Designer" img="https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&q=80&w=150" canKick />
-                  <ParticipantListItem name="Emma Wilson" role="Developer" img="https://images.unsplash.com/photo-1438761681033-6461ffad8d80?auto=format&fit=crop&q=80&w=150" canKick />
-                  <ParticipantListItem name="James Lee" role="QA Engineer" img="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=150" canKick />
-                </div>
-                <button className="w-full mt-2 text-xs font-bold text-[#ec5b13] hover:underline py-2">
-                  View 9 more viewers
-                </button>
-              </div>
-            </div>
-
-            <div className="p-4 border-t border-slate-800">
-              <button className="w-full bg-[#ec5b13]/10 hover:bg-[#ec5b13]/20 text-[#ec5b13] font-bold py-2.5 rounded-xl transition-all flex items-center justify-center gap-2 text-sm">
-                <UserMinus className="w-5 h-5" />
-                Invite Others
-              </button>
+            <div className="flex-1 overflow-y-auto p-2 space-y-1">
+              <ParticipantListItem name={`${name} (You)`} role="Host" isSpeaking={!isMuted} />
+              {peers.map(peer => (
+                <ParticipantListItem key={peer.id} name={peer.name} role="Participant" />
+              ))}
             </div>
           </aside>
         )}
       </main>
 
-      {/* Footer Controls */}
       <footer className="h-20 bg-[#16161e] border-t border-slate-800 flex items-center justify-between px-6 shrink-0">
         <div className="flex items-center gap-2 w-1/4">
           <button 
@@ -171,28 +302,19 @@ export default function CallRoom({ name, room, onLeave }: { name: string, room: 
             className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${showSidebar ? 'bg-slate-800 text-white' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}
           >
             <Users className="w-5 h-5" />
-            <span className="text-sm font-semibold hidden md:inline">14 Participants</span>
+            <span className="text-sm font-semibold hidden md:inline">{peers.length + 1} Participants</span>
           </button>
         </div>
 
         <div className="flex items-center gap-4">
-          <ControlButton 
-            icon={isMuted ? <MicOff /> : <Mic />} 
-            active={!isMuted} 
-            onClick={() => setIsMuted(!isMuted)} 
-            danger={isMuted}
-          />
-          <ControlButton 
-            icon={isVideoOff ? <VideoOff /> : <Video />} 
-            active={!isVideoOff} 
-            onClick={() => setIsVideoOff(!isVideoOff)} 
-            danger={isVideoOff}
-          />
-          <button className="w-14 h-14 rounded-2xl bg-[#ec5b13] flex items-center justify-center hover:scale-105 transition-transform text-white shadow-lg shadow-[#ec5b13]/20">
+          <ControlButton icon={isMuted ? <MicOff /> : <Mic />} active={!isMuted} onClick={toggleMute} danger={isMuted} />
+          <ControlButton icon={isVideoOff ? <VideoOff /> : <Video />} active={!isVideoOff} onClick={toggleVideo} danger={isVideoOff} />
+          <button 
+            onClick={toggleScreenShare}
+            className={`w-14 h-14 rounded-2xl flex items-center justify-center hover:scale-105 transition-transform text-white shadow-lg ${isScreenSharing ? 'bg-red-500 shadow-red-500/20' : 'bg-[#ec5b13] shadow-[#ec5b13]/20'}`}
+          >
             <MonitorUp className="w-6 h-6" />
           </button>
-          <ControlButton icon={<Smile />} />
-          <ControlButton icon={<MoreHorizontal />} />
         </div>
 
         <div className="flex items-center justify-end gap-4 w-1/4">
@@ -206,69 +328,19 @@ export default function CallRoom({ name, room, onLeave }: { name: string, room: 
   );
 }
 
-function ParticipantVideo({ name, img, muted, videoOff, isYou }: { name: string, img: string, muted?: boolean, videoOff?: boolean, isYou?: boolean }) {
-  if (videoOff) {
-    return (
-      <div className="relative rounded-xl overflow-hidden bg-slate-800 border border-slate-700 flex items-center justify-center group">
-        <div className="text-center">
-          <VideoOff className="w-8 h-8 text-slate-500 mx-auto mb-2" />
-          <p className="text-[10px] text-slate-400">{name} {isYou && '(You)'}</p>
-        </div>
-        <div className="absolute top-2 right-2">
-          {muted && (
-            <div className="bg-black/50 p-1 rounded-full backdrop-blur-sm">
-              <MicOff className="w-3 h-3 text-red-400" />
-            </div>
-          )}
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="relative rounded-xl overflow-hidden bg-slate-800 border border-slate-700 group">
-      <img src={img} alt={name} className="absolute inset-0 w-full h-full object-cover" />
-      <div className="absolute bottom-2 left-2 px-2 py-0.5 bg-black/50 backdrop-blur-sm rounded text-[10px] text-white">
-        {name} {isYou && '(You)'}
-      </div>
-      <div className="absolute top-2 right-2">
-        {muted ? (
-          <div className="bg-black/50 p-1 rounded-full backdrop-blur-sm">
-            <MicOff className="w-3 h-3 text-red-400" />
-          </div>
-        ) : (
-          <div className="bg-black/50 p-1 rounded-full backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-opacity">
-            <Mic className="w-3 h-3 text-[#10b981]" />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ParticipantListItem({ name, role, img, isHost, isSpeaking, canKick }: { name: string, role: string, img: string, isHost?: boolean, isSpeaking?: boolean, canKick?: boolean }) {
+function ParticipantListItem({ name, role, isSpeaking }: { name: string, role: string, isSpeaking?: boolean }) {
   return (
     <div className="flex items-center justify-between p-2 rounded-lg hover:bg-slate-800/50 group transition-colors">
       <div className="flex items-center gap-3">
-        <img src={img} alt={name} className="w-10 h-10 rounded-full object-cover bg-slate-800" />
+        <div className="w-10 h-10 rounded-full bg-slate-700 flex items-center justify-center text-sm font-bold text-white">
+          {name.charAt(0).toUpperCase()}
+        </div>
         <div className="flex flex-col">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-white">{name}</span>
-            {isHost && <span className="text-[9px] bg-purple-500/20 text-purple-400 px-1.5 py-0.5 rounded font-bold">HOST</span>}
-          </div>
+          <span className="text-sm font-semibold text-white">{name}</span>
           <span className="text-xs text-slate-500">{role}</span>
         </div>
       </div>
-      <div className="flex items-center gap-2">
-        {isSpeaking && <Mic className="w-4 h-4 text-[#10b981]" />}
-        {canKick && (
-          <div className="hidden group-hover:flex items-center gap-1">
-            <button className="p-1.5 rounded-lg hover:bg-red-500/10 text-slate-400 hover:text-red-500 transition-colors" title="Kick">
-              <Ban className="w-4 h-4" />
-            </button>
-          </div>
-        )}
-      </div>
+      {isSpeaking && <Mic className="w-4 h-4 text-[#10b981]" />}
     </div>
   );
 }
